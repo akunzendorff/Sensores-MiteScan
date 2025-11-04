@@ -1,16 +1,3 @@
-// =================================================================
-// ==                 SENSORES-MITESCAN (ESP32/AHT10)               ==
-// =================================================================
-// Este código é otimizado para um ESP32 usando o sensor AHT10.
-//
-// Funcionalidades:
-// - Lê dados de temperatura e umidade do sensor AHT10.
-// - Permite configurar WiFi e credenciais MQTT via portal cativo (WiFiManager).
-// - Salva leituras localmente no sistema de arquivos (LittleFS).
-// - Envia dados para um broker MQTT em intervalos ou quando um alerta é gerado.
-// - Implementa modo de economia de energia (Modem Sleep) para o Wi-Fi.
-// - Gera um ID único para o dispositivo baseado no endereço MAC.
-// =================================================================
 #include <WiFi.h>
 #include <Wire.h>
 #include <Adafruit_AHTX0.h>
@@ -19,46 +6,37 @@
 #include <ArduinoJson.h>
 #include <LittleFS.h>
 
-// ==== CONFIGURAÇÕES ====
 #define SDA_PIN 21
 #define SCL_PIN 22
 constexpr int LED_PIN = 2;
-constexpr unsigned long INTERVALO_LEITURA = 15000; // 15 segundos
-constexpr int CICLOS_ENVIO = 4;                     // Envia a cada 4 leituras (~1 min)
+constexpr unsigned long INTERVALO_LEITURA = 15000;
+constexpr int CICLOS_ENVIO = 4;
 
-// Limites para geração de alertas
 constexpr float TEMP_MIN = 22.0;
 constexpr float TEMP_MAX = 36.0;
 constexpr float HUM_MIN = 50.0;
 constexpr float HUM_MAX = 90.0;
 
-// ==== MQTT ====
-char mqtt_server[40] = "192.168.3.119";
+char mqtt_server[40] = "broker.hivemq.com";
 char mqtt_port[6] = "1883";
-char mqtt_user[40] = "eder";
-char mqtt_pass[40] = "310104";
 const char* MQTT_TOPIC_DADOS = "colmeia/dados";
 const char* MQTT_TOPIC_ALERTA = "colmeia/alerta";
 const char* MQTT_CLIENT_ID_PREFIX = "ColmeiaESP-";
 
-// ==== OBJETOS ====
 WiFiClient espClient;
 PubSubClient client(espClient);
 Adafruit_AHTX0 aht;
 String uid;
+String hiveID; 
 
-// ==== VARIÁVEIS ====
 int leituras_count = 0;
 
-// ==== FUNÇÕES ====
-
-// ---- Funções de Sensor Abstraídas ----
-bool iniciaSensor() {  
+bool iniciaSensor() {
   Wire.begin(SDA_PIN, SCL_PIN);
   return aht.begin(&Wire);
 }
 
-bool leSensor(float &temperatura, float &umidade) {  
+bool leSensor(float &temperatura, float &umidade) {
   sensors_event_t hum_event, temp_event;
   aht.getEvent(&hum_event, &temp_event);
   if (isnan(temp_event.temperature) || isnan(hum_event.relative_humidity)) {
@@ -69,24 +47,22 @@ bool leSensor(float &temperatura, float &umidade) {
   return true;
 }
 
-// ---- Funções de Armazenamento Local ----
 void salvaDadoLocal(float t, float h, bool alerta) {
   if (!LittleFS.begin()) {
-      Serial.println("❌ Falha ao montar LittleFS para salvar.");
-      return;
+    Serial.println("❌ Falha ao montar LittleFS para salvar.");
+    return;
   }
 
   DynamicJsonDocument doc(4096);
-  DynamicJsonDocument doc(4096); // Aumente se esperar muitos dados acumulados
   File file = LittleFS.open("/dados.json", "r");
-  
+
   if (file) {
     DeserializationError error = deserializeJson(doc, file);
     file.close();
     if (error) {
       Serial.print("❌ Falha ao ler dados.json, recriando arquivo. Erro: ");
       Serial.println(error.c_str());
-      doc.clear(); // Limpa o documento para começar um novo array
+      doc.clear();
     }
   }
 
@@ -94,7 +70,6 @@ void salvaDadoLocal(float t, float h, bool alerta) {
   if (doc.is<JsonArray>()) {
     arr = doc.as<JsonArray>();
   } else {
-    // Se o doc não for um array (vazio ou corrompido), cria um novo
     arr = doc.to<JsonArray>();
   }
 
@@ -105,7 +80,6 @@ void salvaDadoLocal(float t, float h, bool alerta) {
   o["ts"] = millis();
 
   file = LittleFS.open("/dados.json", "w");
-  serializeJson(doc, file);
   if (file) {
     serializeJson(doc, file);
     file.close();
@@ -115,7 +89,6 @@ void salvaDadoLocal(float t, float h, bool alerta) {
   }
 }
 
-// ---- Funções de Rede ----
 String getUID_from_MAC() {
   uint64_t mac = ESP.getEfuseMac();
   char buf[17];
@@ -127,29 +100,28 @@ void conectaWiFi() {
   WiFiManager wm;
   wm.setTitle("Configurar Colmeia");
 
-  // Parâmetros customizados para o portal
   WiFiManagerParameter custom_mqtt_server("server", "MQTT Server", mqtt_server, 40);
   WiFiManagerParameter custom_mqtt_port("port", "MQTT Port", mqtt_port, 6);
-  WiFiManagerParameter custom_mqtt_user("user", "MQTT User", mqtt_user, 40);
-  WiFiManagerParameter custom_mqtt_pass("pass", "MQTT Pass", mqtt_pass, 40);
+  
+  char custom_hive_id_str[40] = "1"; 
+  WiFiManagerParameter custom_hive_id("hiveID", "ID da Colmeia", custom_hive_id_str, 40);
 
   wm.addParameter(&custom_mqtt_server);
   wm.addParameter(&custom_mqtt_port);
-  wm.addParameter(&custom_mqtt_user);
-  wm.addParameter(&custom_mqtt_pass);
+  wm.addParameter(&custom_hive_id); 
 
-  wm.setTimeout(180); // Timeout do portal: 3 minutos
+  wm.setTimeout(180);
   bool ok = wm.autoConnect("ColmeiaSetup");
   if (!ok) {
     Serial.println("❌ Falha WiFi, reiniciando...");
     ESP.restart();
   }
 
-  // Salva os valores configurados no portal
   strcpy(mqtt_server, custom_mqtt_server.getValue());
   strcpy(mqtt_port, custom_mqtt_port.getValue());
-  strcpy(mqtt_user, custom_mqtt_user.getValue());
-  strcpy(mqtt_pass, custom_mqtt_pass.getValue());
+
+  hiveID = String(custom_hive_id.getValue());
+  Serial.println("ID da Colmeia configurado: " + hiveID);
 
   Serial.print("\n✅ WiFi conectado! IP: ");
   Serial.println(WiFi.localIP());
@@ -162,7 +134,8 @@ void conectaMQTT() {
   int tentativas = 0;
   while (!client.connected() && tentativas < 3) {
     Serial.printf("Tentando conectar ao MQTT (tentativa %d/3)...\n", tentativas + 1);
-    if (client.connect(clientId.c_str(), mqtt_user, mqtt_pass)) {
+
+    if (client.connect(clientId.c_str())) {
       Serial.println("✅ Conectado ao MQTT!");
       return;
     } else {
@@ -202,21 +175,21 @@ void enviaMQTT() {
     payload_doc["t"] = o["t"];
     payload_doc["ts"] = o["ts"];
     payload_doc["id"] = uid;
+    payload_doc["hive_id"] = hiveID.toInt();
 
     String payload_str;
     serializeJson(payload_doc, payload_str);
 
     const char* topic = o["a"] ? MQTT_TOPIC_ALERTA : MQTT_TOPIC_DADOS;
     client.publish(topic, payload_str.c_str());
-    
-    delay(150); // Pequeno delay para não sobrecarregar o broker/rede
+
+    delay(150);
   }
 
-  LittleFS.remove("/dados.json"); // Limpa o arquivo após envio
+  LittleFS.remove("/dados.json");
   Serial.println("✅ Dados enviados e arquivo local limpo!");
 }
 
-// ---- Funções de Gerenciamento de Energia ----
 void wifiSleep() {
   WiFi.disconnect(true);
   WiFi.mode(WIFI_OFF);
@@ -228,15 +201,15 @@ void wifiWake() {
   Serial.print("📡 Ligando Wi-Fi...");
   WiFi.mode(WIFI_STA);
   WiFi.begin();
-  
+
   unsigned long start = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) { // Timeout de 15s
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) { 
     delay(500);
     Serial.print(".");
   }
   Serial.println();
 
-  if(WiFi.status() == WL_CONNECTED) {
+  if (WiFi.status() == WL_CONNECTED) {
     Serial.print("✅ Wi-Fi reconectado! IP: ");
     Serial.println(WiFi.localIP());
   } else {
@@ -244,11 +217,10 @@ void wifiWake() {
   }
 }
 
-// ==== SETUP ====
 void setup() {
   Serial.begin(115200);
   Serial.println("\n\n=========================");
-  Serial.println("   INICIANDO SENSOR      ");
+  Serial.println("   INICIANDO SENSOR    ");
   Serial.println("=========================");
 
   pinMode(LED_PIN, OUTPUT);
@@ -260,7 +232,7 @@ void setup() {
     ESP.restart();
   }
   Serial.println("✅ Sensor AHT10 iniciado.");
-  
+
   if (!LittleFS.begin()) {
     Serial.println("❌ Falha crítica ao iniciar LittleFS. Verifique a partição.");
   }
@@ -268,26 +240,22 @@ void setup() {
   uid = getUID_from_MAC();
   Serial.println("ID do dispositivo: " + uid);
 
-  // Se o WiFi não estiver conectado, abre o portal de configuração.
-  // Se já estiver, apenas reconecta.
   if (WiFi.status() != WL_CONNECTED) {
-      conectaWiFi();
+    conectaWiFi();
   }
 
-  wifiSleep();  // Começa com Wi-Fi desligado para economizar energia
+  wifiSleep();
 }
 
-// ==== LOOP ====
 void loop() {
   float temperatura, umidade;
-  
+
   if (!leSensor(temperatura, umidade)) {
     Serial.println("⚠️ Falha ao ler o sensor. Pulando esta leitura.");
     delay(INTERVALO_LEITURA);
     return;
   }
 
-  // Arredonda para uma casa decimal
   temperatura = round(temperatura * 10) / 10.0;
   umidade = round(umidade * 10) / 10.0;
 
@@ -300,20 +268,18 @@ void loop() {
   leituras_count++;
   Serial.printf("📊 Leitura #%d\n", leituras_count);
 
-  // Condições para acordar e enviar dados
   if (alerta || leituras_count >= CICLOS_ENVIO) {
-    digitalWrite(LED_PIN, HIGH); // Liga o LED para indicar atividade de rede
+    digitalWrite(LED_PIN, HIGH);
     wifiWake();
 
     if (WiFi.status() == WL_CONNECTED) {
       conectaMQTT();
       if (client.connected()) {
         enviaMQTT();
-        leituras_count = 0; // Reseta o contador apenas se o envio for bem-sucedido
+        leituras_count = 0;
       }
     } else {
       Serial.println("⚠️ Sem WiFi! Mantendo dados locais para próxima tentativa.");
-      // Pisca o LED para indicar falha de conexão
       for (int i = 0; i < 3; i++) {
         digitalWrite(LED_PIN, HIGH); delay(200);
         digitalWrite(LED_PIN, LOW); delay(200);
