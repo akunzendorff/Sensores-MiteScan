@@ -4,6 +4,7 @@
 #include <WiFiManager.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
+#include <Preferences.h> // NOVO: Biblioteca para salvar dados na memória Flash
 
 #define SDA_PIN 21
 #define SCL_PIN 22
@@ -22,12 +23,50 @@ const char* MQTT_TOPIC_DADOS = "colmeia/dados";
 const char* MQTT_TOPIC_ALERTA = "colmeia/alerta";
 const char* MQTT_CLIENT_ID_PREFIX = "ColmeiaESP-";
 
+// NOVO: Objeto de Preferências
+Preferences preferences; 
+
 WiFiClient espClient;
 PubSubClient client(espClient);
 Adafruit_AHTX0 aht;
 String deviceId;
 char nome_colmeia[40] = "Colmeia 01";
 char conta_usuario[40] = "usuario@email.com";
+
+// =================================================================
+// FUNÇÕES DE PERSISTÊNCIA (PREFERENCES)
+// =================================================================
+
+// Carrega os dados salvos da memória Flash para as variáveis globais
+void carregaConfiguracao() {
+  preferences.begin("colmeia-config", true); // "colmeia-config" é o namespace (read-only)
+  
+  // Se existir um valor salvo, carrega. Senão, usa o valor padrão da variável global.
+  String nomeSalvo = preferences.getString("nome", nome_colmeia);
+  String contaSalva = preferences.getString("conta", conta_usuario);
+
+  // Copia os valores da String para o array char[]
+  nomeSalvo.toCharArray(nome_colmeia, 40);
+  contaSalva.toCharArray(conta_usuario, 40);
+
+  preferences.end();
+  Serial.printf("✅ Configuração carregada. Nome: %s | Conta: %s\n", nome_colmeia, conta_usuario);
+}
+
+// Salva as variáveis globais na memória Flash
+void salvaConfiguracao() {
+  preferences.begin("colmeia-config", false); // Modo de escrita
+  
+  preferences.putString("nome", nome_colmeia);
+  preferences.putString("conta", conta_usuario);
+
+  preferences.end();
+  Serial.println("✅ Configuração salva na Flash.");
+}
+
+// =================================================================
+// FUNÇÕES DO SENSOR
+// =================================================================
 
 bool iniciaSensor() {
   Wire.begin(SDA_PIN, SCL_PIN);
@@ -49,10 +88,15 @@ String getDeviceId() {
   return WiFi.macAddress();
 }
 
+// =================================================================
+// FUNÇÕES DE REDE
+// =================================================================
+
 void conectaWiFi() {
   WiFiManager wm;
   wm.setTitle("Configurar Colmeia");
 
+  // Cria parâmetros customizados com os valores atuais carregados da Flash
   WiFiManagerParameter custom_nome_colmeia("nome", "Nome da Colmeia", nome_colmeia, 40);
   WiFiManagerParameter custom_conta_usuario("conta", "Conta do Usuário", conta_usuario, 40);
 
@@ -67,11 +111,12 @@ void conectaWiFi() {
     return; // Simplesmente retorna se não conseguir conectar.
   }
 
+  // Copia os valores configurados (se houver) para as variáveis globais
   strcpy(nome_colmeia, custom_nome_colmeia.getValue());
   strcpy(conta_usuario, custom_conta_usuario.getValue());
-
-  Serial.println("Nome da Colmeia: " + String(nome_colmeia));
-  Serial.println("Conta do Usuário: " + String(conta_usuario));
+  
+  // NOVO: Salva os novos valores na memória Flash
+  salvaConfiguracao(); 
 
   Serial.print("\n✅ WiFi conectado! IP: ");
   Serial.println(WiFi.localIP());
@@ -97,6 +142,10 @@ void conectaMQTT() {
   Serial.println("❌ Não foi possível conectar ao MQTT após várias tentativas.");
 }
 
+// =================================================================
+// FUNÇÕES DE UTILIDADE
+// =================================================================
+
 void piscaLed(int vezes, int duracao) {
   for (int i = 0; i < vezes; i++) {
     digitalWrite(LED_PIN, HIGH);
@@ -106,11 +155,18 @@ void piscaLed(int vezes, int duracao) {
   }
 }
 
+// =================================================================
+// SETUP E LOOP
+// =================================================================
+
 void setup() {
   Serial.begin(115200);
   Serial.println("\n\n=========================");
-  Serial.println("   INICIANDO SENSOR    ");
+  Serial.println("   INICIANDO SENSOR     ");
   Serial.println("=========================");
+  
+  // NOVO: Carrega as configurações salvas da Flash
+  carregaConfiguracao(); 
 
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, LOW);
@@ -171,6 +227,5 @@ void setup() {
 }
 
 void loop() {
-  // O loop fica vazio, pois o ESP32 nunca chega aqui.
-  // Ele executa o setup() e vai para deep sleep, depois reseta e começa no setup() de novo.
+  // Loop vazio, o dispositivo está em Deep Sleep e nunca chega aqui.
 }
