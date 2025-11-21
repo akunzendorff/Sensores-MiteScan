@@ -17,8 +17,9 @@ constexpr float TEMP_MAX = 36.0;
 constexpr float HUM_MIN = 50.0;
 constexpr float HUM_MAX = 90.0;
 
-char mqtt_server[40] = "broker.hivemq.com";
-char mqtt_port[6] = "1883";
+// Constantes do MQTT (hardcoded para simplificar)
+const char* MQTT_SERVER = "broker.hivemq.com";
+const int MQTT_PORT = 1883;
 const char* MQTT_TOPIC_DADOS = "colmeia/dados";
 const char* MQTT_TOPIC_ALERTA = "colmeia/alerta";
 const char* MQTT_CLIENT_ID_PREFIX = "ColmeiaESP-";
@@ -26,9 +27,9 @@ const char* MQTT_CLIENT_ID_PREFIX = "ColmeiaESP-";
 WiFiClient espClient;
 PubSubClient client(espClient);
 Adafruit_AHTX0 aht;
-String uid;
-String hiveID; 
-
+String deviceId;
+char nome_colmeia[40] = "Colmeia 01";
+char conta_usuario[40] = "usuario@email.com";
 int leituras_count = 0;
 
 bool iniciaSensor() {
@@ -48,67 +49,36 @@ bool leSensor(float &temperatura, float &umidade) {
 }
 
 void salvaDadoLocal(float t, float h, bool alerta) {
-  if (!LittleFS.begin()) {
-    Serial.println("❌ Falha ao montar LittleFS para salvar.");
-    return;
-  }
-
-  DynamicJsonDocument doc(4096);
-  File file = LittleFS.open("/dados.json", "r");
-
+  File file = LittleFS.open("/dados.jsonl", "a");
   if (file) {
-    DeserializationError error = deserializeJson(doc, file);
-    file.close();
-    if (error) {
-      Serial.print("❌ Falha ao ler dados.json, recriando arquivo. Erro: ");
-      Serial.println(error.c_str());
-      doc.clear();
-    }
-  }
+    DynamicJsonDocument doc(128);
+    doc["t"] = t;
+    doc["h"] = h;
+    doc["a"] = alerta;
+    doc["ts"] = millis();
 
-  JsonArray arr;
-  if (doc.is<JsonArray>()) {
-    arr = doc.as<JsonArray>();
-  } else {
-    arr = doc.to<JsonArray>();
-  }
-
-  JsonObject o = arr.createNestedObject();
-  o["t"] = t;
-  o["h"] = h;
-  o["a"] = alerta;
-  o["ts"] = millis();
-
-  file = LittleFS.open("/dados.json", "w");
-  if (file) {
     serializeJson(doc, file);
+    file.println();
     file.close();
     Serial.println("💾 Dado salvo no LittleFS");
   } else {
-    Serial.println("❌ Falha ao abrir dados.json para escrita.");
+    Serial.println("❌ Falha ao abrir arquivo de dados para escrita.");
   }
 }
 
-String getUID_from_MAC() {
-  uint64_t mac = ESP.getEfuseMac();
-  char buf[17];
-  snprintf(buf, sizeof(buf), "%016llX", (unsigned long long)mac);
-  return String(buf);
+String getDeviceId() {
+  return WiFi.macAddress();
 }
 
 void conectaWiFi() {
   WiFiManager wm;
   wm.setTitle("Configurar Colmeia");
 
-  WiFiManagerParameter custom_mqtt_server("server", "MQTT Server", mqtt_server, 40);
-  WiFiManagerParameter custom_mqtt_port("port", "MQTT Port", mqtt_port, 6);
-  
-  char custom_hive_id_str[40] = "1"; 
-  WiFiManagerParameter custom_hive_id("hiveID", "ID da Colmeia", custom_hive_id_str, 40);
+  WiFiManagerParameter custom_nome_colmeia("nome", "Nome da Colmeia", nome_colmeia, 40);
+  WiFiManagerParameter custom_conta_usuario("conta", "Conta do Usuário", conta_usuario, 40);
 
-  wm.addParameter(&custom_mqtt_server);
-  wm.addParameter(&custom_mqtt_port);
-  wm.addParameter(&custom_hive_id); 
+  wm.addParameter(&custom_nome_colmeia);
+  wm.addParameter(&custom_conta_usuario);
 
   wm.setTimeout(180);
   bool ok = wm.autoConnect("ColmeiaSetup");
@@ -117,19 +87,19 @@ void conectaWiFi() {
     ESP.restart();
   }
 
-  strcpy(mqtt_server, custom_mqtt_server.getValue());
-  strcpy(mqtt_port, custom_mqtt_port.getValue());
+  strcpy(nome_colmeia, custom_nome_colmeia.getValue());
+  strcpy(conta_usuario, custom_conta_usuario.getValue());
 
-  hiveID = String(custom_hive_id.getValue());
-  Serial.println("ID da Colmeia configurado: " + hiveID);
+  Serial.println("Nome da Colmeia: " + String(nome_colmeia));
+  Serial.println("Conta do Usuário: " + String(conta_usuario));
 
   Serial.print("\n✅ WiFi conectado! IP: ");
   Serial.println(WiFi.localIP());
 }
 
 void conectaMQTT() {
-  client.setServer(mqtt_server, atoi(mqtt_port));
-  String clientId = String(MQTT_CLIENT_ID_PREFIX) + uid;
+  client.setServer(MQTT_SERVER, MQTT_PORT);
+  String clientId = String(MQTT_CLIENT_ID_PREFIX) + deviceId;
 
   int tentativas = 0;
   while (!client.connected() && tentativas < 3) {
@@ -148,52 +118,46 @@ void conectaMQTT() {
 }
 
 void enviaMQTT() {
-  if (!LittleFS.begin()) {
-    Serial.println("❌ Falha ao montar LittleFS para envio.");
-    return;
-  }
-  File file = LittleFS.open("/dados.json", "r");
+  File file = LittleFS.open("/dados.jsonl", "r");
   if (!file) {
     Serial.println("ℹ️ Nenhum dado local para enviar.");
     return;
   }
 
-  DynamicJsonDocument doc(4096);
-  DeserializationError error = deserializeJson(doc, file);
+  Serial.println("📤 Enviando leituras salvas...");
+  
+  while (file.available()) {
+    String line = file.readStringUntil('\n');
+    if (line.length() > 0) {
+      DynamicJsonDocument doc(128);
+      deserializeJson(doc, line);
+
+      DynamicJsonDocument payload_doc(256);
+      payload_doc["h"] = doc["h"];
+      payload_doc["t"] = doc["t"];
+      payload_doc["ts"] = doc["ts"];
+      payload_doc["id"] = deviceId;
+      payload_doc["nome_colmeia"] = nome_colmeia;
+      payload_doc["conta_usuario"] = conta_usuario;
+
+      String payload_str;
+      serializeJson(payload_doc, payload_str);
+
+      bool isAlerta = doc["a"];
+      const char* topic = isAlerta ? MQTT_TOPIC_ALERTA : MQTT_TOPIC_DADOS;
+      
+      client.publish(topic, payload_str.c_str());
+      delay(100); // Pequeno delay para não sobrecarregar o broker
+    }
+  }
   file.close();
-  if (error) {
-    Serial.println("❌ Falha ao ler dados.json para envio.");
-    return;
-  }
 
-  JsonArray arr = doc.as<JsonArray>();
-  Serial.printf("📤 Enviando %d leituras salvas...\n", arr.size());
-
-  for (JsonObject o : arr) {
-    DynamicJsonDocument payload_doc(256);
-    payload_doc["h"] = o["h"];
-    payload_doc["t"] = o["t"];
-    payload_doc["ts"] = o["ts"];
-    payload_doc["id"] = uid;
-    payload_doc["hive_id"] = hiveID.toInt();
-
-    String payload_str;
-    serializeJson(payload_doc, payload_str);
-
-    const char* topic = o["a"] ? MQTT_TOPIC_ALERTA : MQTT_TOPIC_DADOS;
-    client.publish(topic, payload_str.c_str());
-
-    delay(150);
-  }
-
-  LittleFS.remove("/dados.json");
+  LittleFS.remove("/dados.jsonl");
   Serial.println("✅ Dados enviados e arquivo local limpo!");
 }
 
 void wifiSleep() {
-  WiFi.disconnect(true);
   WiFi.mode(WIFI_OFF);
-  esp_wifi_stop();
   Serial.println("📴 Wi-Fi em modo Modem Sleep.");
 }
 
@@ -237,8 +201,8 @@ void setup() {
     Serial.println("❌ Falha crítica ao iniciar LittleFS. Verifique a partição.");
   }
 
-  uid = getUID_from_MAC();
-  Serial.println("ID do dispositivo: " + uid);
+  deviceId = getDeviceId();
+  Serial.println("ID do dispositivo: " + deviceId);
 
   if (WiFi.status() != WL_CONNECTED) {
     conectaWiFi();
