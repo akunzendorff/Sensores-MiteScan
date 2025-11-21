@@ -4,13 +4,11 @@
 #include <WiFiManager.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
-#include <LittleFS.h>
 
 #define SDA_PIN 21
 #define SCL_PIN 22
 constexpr int LED_PIN = 2;
-constexpr unsigned long INTERVALO_LEITURA = 15000;
-constexpr int CICLOS_ENVIO = 4;
+constexpr unsigned long DEEP_SLEEP_INTERVAL_MS = 180000; // 3 minutos
 
 constexpr float TEMP_MIN = 22.0;
 constexpr float TEMP_MAX = 36.0;
@@ -30,7 +28,6 @@ Adafruit_AHTX0 aht;
 String deviceId;
 char nome_colmeia[40] = "Colmeia 01";
 char conta_usuario[40] = "usuario@email.com";
-int leituras_count = 0;
 
 bool iniciaSensor() {
   Wire.begin(SDA_PIN, SCL_PIN);
@@ -48,24 +45,6 @@ bool leSensor(float &temperatura, float &umidade) {
   return true;
 }
 
-void salvaDadoLocal(float t, float h, bool alerta) {
-  File file = LittleFS.open("/dados.jsonl", "a");
-  if (file) {
-    DynamicJsonDocument doc(128);
-    doc["t"] = t;
-    doc["h"] = h;
-    doc["a"] = alerta;
-    doc["ts"] = millis();
-
-    serializeJson(doc, file);
-    file.println();
-    file.close();
-    Serial.println("💾 Dado salvo no LittleFS");
-  } else {
-    Serial.println("❌ Falha ao abrir arquivo de dados para escrita.");
-  }
-}
-
 String getDeviceId() {
   return WiFi.macAddress();
 }
@@ -80,11 +59,12 @@ void conectaWiFi() {
   wm.addParameter(&custom_nome_colmeia);
   wm.addParameter(&custom_conta_usuario);
 
-  wm.setTimeout(180);
-  bool ok = wm.autoConnect("ColmeiaSetup");
-  if (!ok) {
-    Serial.println("❌ Falha WiFi, reiniciando...");
-    ESP.restart();
+  // Define um timeout mais curto para o portal de configuração para economizar bateria.
+  wm.setTimeout(60); 
+
+  if (!wm.autoConnect("ColmeiaSetup")) {
+    Serial.println("❌ Portal de configuração expirou. Indo dormir para tentar mais tarde.");
+    return; // Simplesmente retorna se não conseguir conectar.
   }
 
   strcpy(nome_colmeia, custom_nome_colmeia.getValue());
@@ -117,67 +97,12 @@ void conectaMQTT() {
   Serial.println("❌ Não foi possível conectar ao MQTT após várias tentativas.");
 }
 
-void enviaMQTT() {
-  File file = LittleFS.open("/dados.jsonl", "r");
-  if (!file) {
-    Serial.println("ℹ️ Nenhum dado local para enviar.");
-    return;
-  }
-
-  Serial.println("📤 Enviando leituras salvas...");
-  
-  while (file.available()) {
-    String line = file.readStringUntil('\n');
-    if (line.length() > 0) {
-      DynamicJsonDocument doc(128);
-      deserializeJson(doc, line);
-
-      DynamicJsonDocument payload_doc(256);
-      payload_doc["h"] = doc["h"];
-      payload_doc["t"] = doc["t"];
-      payload_doc["ts"] = doc["ts"];
-      payload_doc["id"] = deviceId;
-      payload_doc["nome_colmeia"] = nome_colmeia;
-      payload_doc["conta_usuario"] = conta_usuario;
-
-      String payload_str;
-      serializeJson(payload_doc, payload_str);
-
-      bool isAlerta = doc["a"];
-      const char* topic = isAlerta ? MQTT_TOPIC_ALERTA : MQTT_TOPIC_DADOS;
-      
-      client.publish(topic, payload_str.c_str());
-      delay(100); // Pequeno delay para não sobrecarregar o broker
-    }
-  }
-  file.close();
-
-  LittleFS.remove("/dados.jsonl");
-  Serial.println("✅ Dados enviados e arquivo local limpo!");
-}
-
-void wifiSleep() {
-  WiFi.mode(WIFI_OFF);
-  Serial.println("📴 Wi-Fi em modo Modem Sleep.");
-}
-
-void wifiWake() {
-  Serial.print("📡 Ligando Wi-Fi...");
-  WiFi.mode(WIFI_STA);
-  WiFi.begin();
-
-  unsigned long start = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) { 
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println();
-
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.print("✅ Wi-Fi reconectado! IP: ");
-    Serial.println(WiFi.localIP());
-  } else {
-    Serial.println("❌ Falha ao reconectar o Wi-Fi.");
+void piscaLed(int vezes, int duracao) {
+  for (int i = 0; i < vezes; i++) {
+    digitalWrite(LED_PIN, HIGH);
+    delay(duracao);
+    digitalWrite(LED_PIN, LOW);
+    delay(duracao);
   }
 }
 
@@ -197,62 +122,55 @@ void setup() {
   }
   Serial.println("✅ Sensor AHT10 iniciado.");
 
-  if (!LittleFS.begin()) {
-    Serial.println("❌ Falha crítica ao iniciar LittleFS. Verifique a partição.");
-  }
-
   deviceId = getDeviceId();
   Serial.println("ID do dispositivo: " + deviceId);
 
-  if (WiFi.status() != WL_CONNECTED) {
-    conectaWiFi();
-  }
-
-  wifiSleep();
-}
-
-void loop() {
   float temperatura, umidade;
-
   if (!leSensor(temperatura, umidade)) {
-    Serial.println("⚠️ Falha ao ler o sensor. Pulando esta leitura.");
-    delay(INTERVALO_LEITURA);
-    return;
-  }
+    Serial.println("⚠️ Falha ao ler o sensor. Entrando em sleep.");
+  } else {
+    temperatura = round(temperatura * 10) / 10.0;
+    umidade = round(umidade * 10) / 10.0;
+    bool isAlerta = (temperatura < TEMP_MIN || temperatura > TEMP_MAX || umidade < HUM_MIN || umidade > HUM_MAX);
 
-  temperatura = round(temperatura * 10) / 10.0;
-  umidade = round(umidade * 10) / 10.0;
+    Serial.printf("🌡️ %.1f°C | 💧 %.1f%% | Alerta: %s\n", temperatura, umidade, isAlerta ? "SIM" : "NÃO");
 
-  bool alerta = (temperatura < TEMP_MIN || temperatura > TEMP_MAX || umidade < HUM_MIN || umidade > HUM_MAX);
-
-  Serial.printf("🌡️ %.1f°C | 💧 %.1f%% | Alerta: %s\n", temperatura, umidade, alerta ? "SIM" : "NÃO");
-
-  salvaDadoLocal(temperatura, umidade, alerta);
-
-  leituras_count++;
-  Serial.printf("📊 Leitura #%d\n", leituras_count);
-
-  if (alerta || leituras_count >= CICLOS_ENVIO) {
     digitalWrite(LED_PIN, HIGH);
-    wifiWake();
-
+    conectaWiFi();
     if (WiFi.status() == WL_CONNECTED) {
       conectaMQTT();
       if (client.connected()) {
-        enviaMQTT();
-        leituras_count = 0;
+        DynamicJsonDocument payload_doc(256);
+        payload_doc["h"] = umidade;
+        payload_doc["t"] = temperatura;
+        payload_doc["id"] = deviceId;
+        payload_doc["nome_colmeia"] = nome_colmeia;
+        payload_doc["conta_usuario"] = conta_usuario;
+
+        String payload_str;
+        serializeJson(payload_doc, payload_str);
+
+        const char* topic = isAlerta ? MQTT_TOPIC_ALERTA : MQTT_TOPIC_DADOS;
+        
+        client.publish(topic, payload_str.c_str());
+        Serial.println("✅ Dados enviados via MQTT!");
+      } else {
+        Serial.println("⚠️ Falha ao conectar no MQTT. Verifique o broker.");
+        piscaLed(2, 500); // 2 piscadas lentas para erro de MQTT
       }
     } else {
-      Serial.println("⚠️ Sem WiFi! Mantendo dados locais para próxima tentativa.");
-      for (int i = 0; i < 3; i++) {
-        digitalWrite(LED_PIN, HIGH); delay(200);
-        digitalWrite(LED_PIN, LOW); delay(200);
-      }
+      Serial.println("⚠️ Sem conexão WiFi, não foi possível enviar os dados.");
+      piscaLed(3, 150); // 3 piscadas rápidas para erro de WiFi
     }
     digitalWrite(LED_PIN, LOW);
-    wifiSleep();
   }
 
-  Serial.printf("💤 Entrando em modo sleep por %lu segundos...\n\n", INTERVALO_LEITURA / 1000);
-  delay(INTERVALO_LEITURA);
+  Serial.printf("💤 Entrando em Deep Sleep por %lu segundos...\n\n", DEEP_SLEEP_INTERVAL_MS / 1000);
+  esp_sleep_enable_timer_wakeup(DEEP_SLEEP_INTERVAL_MS * 1000); // Converte milissegundos para microssegundos
+  esp_deep_sleep_start();
+}
+
+void loop() {
+  // O loop fica vazio, pois o ESP32 nunca chega aqui.
+  // Ele executa o setup() e vai para deep sleep, depois reseta e começa no setup() de novo.
 }
